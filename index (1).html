@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>퇴근하지 못한 사람들 — AI 건설현장 위험 감지</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect } = React;
+
+const LANGS = {
+  ko: { label: "한국어", name: "Korean" },
+  vi: { label: "Tiếng Việt", name: "Vietnamese" },
+  th: { label: "ภาษาไทย", name: "Thai" },
+  zh: { label: "中文", name: "Chinese" },
+  en: { label: "English", name: "English" },
+};
+
+const SEVERITY = {
+  high: { ko: "위험", color: "#e5484d", bg: "rgba(229,72,77,0.14)" },
+  medium: { ko: "주의", color: "#f5a623", bg: "rgba(245,166,35,0.14)" },
+  low: { ko: "양호", color: "#46a758", bg: "rgba(70,167,88,0.14)" },
+};
+
+const SPEECH_LANG = { ko: "ko-KR", vi: "vi-VN", th: "th-TH", zh: "zh-CN", en: "en-US" };
+const MAX_DIM = 1280;
+
+// 데모 모드용 미리 준비된 분석 결과 (네트워크/키 문제 시 백업)
+const DEMO_RESULT = {
+  ko: "작업자가 안전모와 안전벨트를 착용하지 않은 채 고소 작업 중으로, 추락 위험이 매우 높습니다.",
+  data: {
+    riskScore: 87,
+    summary_ko: "작업자가 안전모·안전벨트 미착용 상태로 고소 작업 중이며 추락 위험이 매우 높습니다.",
+    hazards: [
+      { label_ko: "안전모 미착용", severity: "high", detail_ko: "머리 보호구가 없어 낙하물·충돌 시 중상 위험이 있습니다.", box: { x: 0.41, y: 0.12, w: 0.16, h: 0.16 } },
+      { label_ko: "안전벨트 미착용", severity: "high", detail_ko: "고소 구간에서 추락 방지 장구가 확인되지 않습니다.", box: { x: 0.34, y: 0.30, w: 0.30, h: 0.40 } },
+      { label_ko: "불안정한 발판", severity: "medium", detail_ko: "발판 고정 상태가 불안정해 보입니다.", box: { x: 0.30, y: 0.70, w: 0.42, h: 0.18 } },
+    ],
+  },
+};
+
+function App() {
+  const [imageData, setImageData] = useState(null);
+  const [imageUrl, setImageUrl] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [lang, setLang] = useState("vi");
+  const [log, setLog] = useState([]);
+  const [dragging, setDragging] = useState(false);
+  const [imgInfo, setImgInfo] = useState(null);
+  const [demoMode, setDemoMode] = useState(false);
+  const fileRef = useRef(null);
+  const imgRef = useRef(null);
+  const [imgDims, setImgDims] = useState({ w: 0, h: 0 });
+
+  function processFile(file) {
+    if (!file) return;
+    setError(null);
+    setResult(null);
+    setImgInfo(null);
+    if (!file.type.startsWith("image/")) {
+      setError("이미지 파일만 업로드할 수 있습니다 (JPG, PNG 등).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => setError("파일을 읽지 못했습니다. 다른 파일로 시도해 주세요.");
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => setError("이미지를 불러오지 못했습니다. 손상되었거나 지원하지 않는 형식일 수 있습니다.");
+      img.onload = () => {
+        const { width, height } = img;
+        let w = width, h = height;
+        if (Math.max(w, h) > MAX_DIM) {
+          const scale = MAX_DIM / Math.max(w, h);
+          w = Math.round(w * scale);
+          h = Math.round(h * scale);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        const jpegUrl = canvas.toDataURL("image/jpeg", 0.85);
+        setImageUrl(jpegUrl);
+        setImageData(jpegUrl.split(",")[1]);
+        if (Math.max(width, height) > MAX_DIM) {
+          setImgInfo("원본 " + width + "×" + height + " → " + w + "×" + h + " 로 자동 축소했습니다.");
+        }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+    processFile(e.dataTransfer.files?.[0]);
+  }
+
+  async function analyze() {
+    if (!imageData) {
+      setError("먼저 현장 사진을 업로드해 주세요.");
+      return;
+    }
+    setAnalyzing(true);
+    setError(null);
+    setResult(null);
+
+    // 데모 모드: 미리 준비된 결과를 약간의 지연 후 표시
+    if (demoMode) {
+      setTimeout(() => {
+        const parsed = JSON.parse(JSON.stringify(DEMO_RESULT.data));
+        parsed.voiceAlert = demoVoiceAlert(lang);
+        finishResult(parsed);
+        setAnalyzing(false);
+      }, 900);
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: imageData, lang }),
+      });
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const errBody = await response.json();
+          detail = errBody?.error || JSON.stringify(errBody);
+        } catch (_) {
+          detail = await response.text();
+        }
+        throw new Error(detail || ("요청 실패 (" + response.status + ")"));
+      }
+      const parsed = await response.json();
+      finishResult(parsed);
+    } catch (err) {
+      console.error(err);
+      setError(err.message || "분석에 실패했습니다. 다시 시도해 주세요.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function finishResult(parsed) {
+    setResult(parsed);
+    const entry = {
+      time: new Date().toLocaleTimeString("ko-KR"),
+      score: parsed.riskScore,
+      count: parsed.hazards?.length || 0,
+      top: parsed.hazards?.[0]?.label_ko || "특이사항 없음",
+    };
+    setLog((prev) => [entry, ...prev].slice(0, 8));
+  }
+
+  function demoVoiceAlert(l) {
+    const map = {
+      ko: "위험합니다! 안전모와 안전벨트를 즉시 착용하세요.",
+      vi: "Nguy hiểm! Hãy đội mũ bảo hộ và đeo dây an toàn ngay lập tức.",
+      th: "อันตราย! กรุณาสวมหมวกนิรภัยและเข็มขัดนิรภัยทันที",
+      zh: "危险！请立即佩戴安全帽和安全带。",
+      en: "Danger! Put on your hard hat and safety harness immediately.",
+    };
+    return map[l] || map.ko;
+  }
+
+  function speakAlert() {
+    if (!result?.voiceAlert || !window.speechSynthesis) return;
+    const u = new SpeechSynthesisUtterance(result.voiceAlert);
+    u.lang = SPEECH_LANG[lang] || "ko-KR";
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  }
+
+  useEffect(() => {
+    if (imgRef.current && imageUrl) {
+      const el = imgRef.current;
+      const update = () => setImgDims({ w: el.clientWidth, h: el.clientHeight });
+      if (el.complete) update();
+      el.onload = update;
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+  }, [imageUrl, result]);
+
+  const scoreColor = (s) => (s >= 70 ? "#e5484d" : s >= 40 ? "#f5a623" : "#46a758");
+
+  return (
+    <div style={S.root}>
+      <header style={S.header}>
+        <div style={S.brandRow}>
+          <div style={S.logoMark}>!</div>
+          <div>
+            <div style={S.kicker}>AI 기반 건설현장 산업재해 예방 시스템</div>
+            <h1 style={S.title}>퇴근하지 못한 사람들</h1>
+          </div>
+        </div>
+        <div style={S.headerRight}>
+          <div style={S.pipeline}>
+            {["감지", "판단", "경보", "학습"].map((step, i) => (
+              <React.Fragment key={step}>
+                <span style={S.pipeStep}>{step}</span>
+                {i < 3 && <span style={S.pipeArrow}>→</span>}
+              </React.Fragment>
+            ))}
+          </div>
+          <label style={S.demoToggle}>
+            <input type="checkbox" checked={demoMode} onChange={(e) => setDemoMode(e.target.checked)} />
+            <span>데모 모드</span>
+          </label>
+        </div>
+      </header>
+
+      <div style={S.grid} className="resp-grid">
+        <section style={S.leftCol}>
+          <div
+            style={{ ...S.dropzone, ...(dragging ? S.dropzoneActive : {}) }}
+            onClick={() => fileRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={onDrop}
+          >
+            {imageUrl ? (
+              <div style={S.imgWrap}>
+                <img ref={imgRef} src={imageUrl} alt="현장" style={S.img} />
+                {result?.hazards?.map((h, i) =>
+                  h.box ? (
+                    <div key={i} style={{
+                      position: "absolute",
+                      left: h.box.x * imgDims.w, top: h.box.y * imgDims.h,
+                      width: h.box.w * imgDims.w, height: h.box.h * imgDims.h,
+                      border: "2.5px solid " + (SEVERITY[h.severity]?.color || "#e5484d"),
+                      borderRadius: 4, pointerEvents: "none",
+                    }}>
+                      <span style={{
+                        position: "absolute", top: -22, left: -2,
+                        background: SEVERITY[h.severity]?.color || "#e5484d",
+                        color: "#fff", fontSize: 11, fontWeight: 700,
+                        padding: "2px 7px", borderRadius: 4, whiteSpace: "nowrap",
+                      }}>{h.label_ko}</span>
+                    </div>
+                  ) : null
+                )}
+              </div>
+            ) : (
+              <div style={S.dropEmpty}>
+                <div style={S.dropIcon}>＋</div>
+                <div style={S.dropTitle}>현장 사진을 업로드하세요</div>
+                <div style={S.dropSub}>클릭하거나 이미지를 끌어다 놓으세요 · JPG / PNG</div>
+              </div>
+            )}
+          </div>
+          <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }}
+            onChange={(e) => processFile(e.target.files?.[0])} />
+
+          {imgInfo && <div style={S.info}>{imgInfo}</div>}
+
+          <div style={S.controls}>
+            <div style={S.langRow}>
+              <span style={S.langLabel}>작업자 언어</span>
+              <div style={S.langChips}>
+                {Object.entries(LANGS).map(([k, v]) => (
+                  <button key={k} onClick={() => setLang(k)}
+                    style={{ ...S.langChip, ...(lang === k ? S.langChipActive : {}) }}>{v.label}</button>
+                ))}
+              </div>
+            </div>
+            <button style={{ ...S.analyzeBtn, ...(analyzing ? S.analyzeBtnBusy : {}) }}
+              onClick={analyze} disabled={analyzing}>
+              {analyzing ? "분석 중…" : "위험 분석 실행"}
+            </button>
+          </div>
+          {error && <div style={S.error}>{error}</div>}
+        </section>
+
+        <section style={S.rightCol}>
+          {!result && !analyzing && (
+            <div style={S.placeholder}>
+              <p style={S.phLead}>판단 결과가 여기에 표시됩니다.</p>
+              <p style={S.phSub}>AI가 현장 사진을 분석해 안전모·안전벨트 미착용, 추락 위험 자세 등을
+                감지하고, 작업자의 모국어로 음성 경보를 생성합니다.</p>
+            </div>
+          )}
+          {analyzing && (
+            <div style={S.placeholder}>
+              <div className="pulse" style={S.pulseRing} />
+              <p style={S.phLead}>현장을 판독하는 중…</p>
+            </div>
+          )}
+          {result && (
+            <>
+              <div style={S.scoreCard}>
+                <div>
+                  <div style={S.scoreLabel}>종합 위험도 점수</div>
+                  <div style={{ ...S.scoreVal, color: scoreColor(result.riskScore) }}>
+                    {result.riskScore}<span style={S.scoreMax}>/100</span>
+                  </div>
+                </div>
+                <div style={S.scoreBarWrap}>
+                  <div style={{ ...S.scoreBar, width: result.riskScore + "%", background: scoreColor(result.riskScore) }} />
+                </div>
+                <p style={S.summary}>{result.summary_ko}</p>
+              </div>
+              <div style={S.alertCard}>
+                <div style={S.alertHead}>
+                  <span style={S.alertBadge}>🔊 스마트 안전모 음성 경보</span>
+                  <span style={S.alertLang}>{LANGS[lang].label}</span>
+                </div>
+                <p style={S.alertText}>{result.voiceAlert}</p>
+                <button style={S.speakBtn} onClick={speakAlert}>음성으로 재생</button>
+              </div>
+              <div style={S.hazardSection}>
+                <div style={S.sectionTitle}>감지된 위험요소 <span style={S.count}>{result.hazards?.length || 0}건</span></div>
+                {result.hazards?.length ? result.hazards.map((h, i) => {
+                  const sev = SEVERITY[h.severity] || SEVERITY.medium;
+                  return (
+                    <div key={i} style={{ ...S.hazardItem, background: sev.bg }}>
+                      <span style={{ ...S.sevTag, background: sev.color }}>{sev.ko}</span>
+                      <div>
+                        <div style={S.hazardLabel}>{h.label_ko}</div>
+                        <div style={S.hazardDetail}>{h.detail_ko}</div>
+                      </div>
+                    </div>
+                  );
+                }) : <div style={S.noHazard}>감지된 위험요소가 없습니다.</div>}
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+
+      <section style={S.logSection}>
+        <div style={S.sectionTitle}>아차사고 학습 데이터 <span style={S.logHint}>· 모든 감지가 모델 재학습 데이터로 누적됩니다</span></div>
+        {log.length ? (
+          <div style={S.logTable}>
+            <div style={{ ...S.logRow, ...S.logHeader }}>
+              <span>시각</span><span>위험도</span><span>감지 건수</span><span>주요 위험</span>
+            </div>
+            {log.map((e, i) => (
+              <div key={i} style={S.logRow}>
+                <span style={S.logTime}>{e.time}</span>
+                <span style={{ color: scoreColor(e.score), fontWeight: 700 }}>{e.score}</span>
+                <span>{e.count}건</span>
+                <span>{e.top}</span>
+              </div>
+            ))}
+          </div>
+        ) : <div style={S.logEmpty}>아직 누적된 데이터가 없습니다. 분석을 실행해 보세요.</div>}
+      </section>
+
+      <footer style={S.footer}>
+        국민대학교 · 인공지능과 창의적사고 · 분석 엔진: Google Gemini &nbsp;|&nbsp; 본 데모의 위험 분석은 참고용이며 실제 현장 적용 전 검증이 필요합니다.
+      </footer>
+    </div>
+  );
+}
+
+const ACCENT = "#ff5a3c";
+const INK = "#16140f";
+const PAPER = "#f4f1ea";
+const S = {
+  root: { fontFamily: "'Pretendard', -apple-system, system-ui, sans-serif", background: PAPER, color: INK, minHeight: "100vh", padding: "28px clamp(16px,4vw,48px)", maxWidth: 1180, margin: "0 auto" },
+  header: { borderBottom: "2px solid " + INK, paddingBottom: 18, marginBottom: 24 },
+  brandRow: { display: "flex", alignItems: "center", gap: 14 },
+  logoMark: { width: 44, height: 44, borderRadius: 10, background: ACCENT, color: "#fff", fontSize: 26, fontWeight: 900, display: "grid", placeItems: "center", boxShadow: "3px 3px 0 " + INK },
+  kicker: { fontSize: 12, fontWeight: 700, letterSpacing: "0.06em", color: "#7a7468", textTransform: "uppercase" },
+  title: { fontSize: "clamp(26px,4vw,38px)", fontWeight: 900, margin: "2px 0 0", letterSpacing: "-0.02em" },
+  headerRight: { display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 16, flexWrap: "wrap", gap: 12 },
+  pipeline: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  pipeStep: { fontSize: 13, fontWeight: 700, background: "#fff", border: "1.5px solid " + INK, borderRadius: 20, padding: "4px 14px" },
+  pipeArrow: { color: ACCENT, fontWeight: 900 },
+  demoToggle: { display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 700, color: "#7a7468", cursor: "pointer", userSelect: "none" },
+  grid: { display: "grid", gridTemplateColumns: "minmax(0,1.1fr) minmax(0,1fr)", gap: 22, alignItems: "start" },
+  leftCol: { display: "flex", flexDirection: "column", gap: 16 },
+  dropzone: { border: "2px dashed #c4bdac", borderRadius: 14, background: "#fff", minHeight: 320, display: "grid", placeItems: "center", cursor: "pointer", overflow: "hidden" },
+  dropzoneActive: { borderColor: ACCENT, background: "rgba(255,90,60,0.04)" },
+  dropEmpty: { textAlign: "center", padding: 40 },
+  dropIcon: { fontSize: 44, color: "#c4bdac", lineHeight: 1 },
+  dropTitle: { fontSize: 17, fontWeight: 800, marginTop: 12 },
+  dropSub: { fontSize: 13, color: "#8a8473", marginTop: 6 },
+  imgWrap: { position: "relative", width: "100%", lineHeight: 0 },
+  img: { width: "100%", display: "block", borderRadius: 12 },
+  controls: { display: "flex", flexDirection: "column", gap: 14 },
+  langRow: { display: "flex", flexDirection: "column", gap: 8 },
+  langLabel: { fontSize: 13, fontWeight: 700, color: "#5a5446" },
+  langChips: { display: "flex", gap: 7, flexWrap: "wrap" },
+  langChip: { fontSize: 13, fontWeight: 600, padding: "6px 13px", borderRadius: 18, border: "1.5px solid #d8d1c2", background: "#fff", color: "#5a5446", cursor: "pointer" },
+  langChipActive: { background: INK, color: "#fff", borderColor: INK },
+  analyzeBtn: { fontSize: 16, fontWeight: 800, padding: "14px", borderRadius: 12, border: "none", background: ACCENT, color: "#fff", cursor: "pointer", boxShadow: "3px 3px 0 " + INK },
+  analyzeBtnBusy: { opacity: 0.7, cursor: "wait" },
+  error: { background: "rgba(229,72,77,0.12)", color: "#c0353a", fontSize: 13.5, fontWeight: 600, padding: "10px 14px", borderRadius: 10, lineHeight: 1.5, wordBreak: "break-word" },
+  info: { background: "rgba(70,167,88,0.10)", color: "#2f6b3f", fontSize: 13, fontWeight: 600, padding: "8px 12px", borderRadius: 10 },
+  rightCol: { display: "flex", flexDirection: "column", gap: 16, minHeight: 320 },
+  placeholder: { background: "#fff", border: "1.5px solid #e3ddcf", borderRadius: 14, padding: 28, textAlign: "center" },
+  phLead: { fontSize: 16, fontWeight: 800, margin: 0 },
+  phSub: { fontSize: 14, color: "#7a7468", lineHeight: 1.7, marginTop: 10 },
+  pulseRing: { width: 46, height: 46, borderRadius: "50%", border: "4px solid " + ACCENT, borderTopColor: "transparent", margin: "0 auto 16px" },
+  scoreCard: { background: "#fff", border: "1.5px solid " + INK, borderRadius: 14, padding: 20, boxShadow: "4px 4px 0 rgba(22,20,15,0.08)" },
+  scoreLabel: { fontSize: 13, fontWeight: 700, color: "#7a7468" },
+  scoreVal: { fontSize: 46, fontWeight: 900, lineHeight: 1, marginTop: 4 },
+  scoreMax: { fontSize: 18, color: "#b5ae9e", fontWeight: 700 },
+  scoreBarWrap: { height: 9, background: "#eee7d8", borderRadius: 6, overflow: "hidden", margin: "14px 0 12px" },
+  scoreBar: { height: "100%", borderRadius: 6, transition: "width .6s ease" },
+  summary: { fontSize: 14.5, fontWeight: 600, margin: 0, lineHeight: 1.6 },
+  alertCard: { background: INK, color: "#fff", borderRadius: 14, padding: 18 },
+  alertHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
+  alertBadge: { fontSize: 13, fontWeight: 700 },
+  alertLang: { fontSize: 12, fontWeight: 700, background: ACCENT, padding: "3px 10px", borderRadius: 12 },
+  alertText: { fontSize: 18, fontWeight: 700, lineHeight: 1.5, margin: "0 0 14px" },
+  speakBtn: { fontSize: 14, fontWeight: 700, background: "#fff", color: INK, border: "none", borderRadius: 10, padding: "9px 16px", cursor: "pointer" },
+  hazardSection: { background: "#fff", border: "1.5px solid #e3ddcf", borderRadius: 14, padding: 18 },
+  sectionTitle: { fontSize: 15, fontWeight: 800, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 },
+  count: { fontSize: 13, color: "#fff", background: ACCENT, padding: "2px 9px", borderRadius: 12 },
+  hazardItem: { display: "flex", gap: 12, alignItems: "flex-start", padding: "12px 14px", borderRadius: 10, marginBottom: 8 },
+  sevTag: { color: "#fff", fontSize: 12, fontWeight: 800, padding: "3px 9px", borderRadius: 6, flexShrink: 0, marginTop: 1 },
+  hazardLabel: { fontSize: 15, fontWeight: 800 },
+  hazardDetail: { fontSize: 13.5, color: "#5a5446", marginTop: 3, lineHeight: 1.5 },
+  noHazard: { fontSize: 14, color: "#7a7468", padding: 8 },
+  logSection: { background: "#fff", border: "1.5px solid #e3ddcf", borderRadius: 14, padding: 18, marginTop: 22 },
+  logHint: { fontSize: 12, fontWeight: 500, color: "#9a9484" },
+  logTable: { display: "flex", flexDirection: "column", gap: 2 },
+  logRow: { display: "grid", gridTemplateColumns: "1fr 0.7fr 0.8fr 1.6fr", gap: 8, padding: "9px 6px", fontSize: 13.5, borderBottom: "1px solid #f0ebe0" },
+  logHeader: { fontWeight: 800, color: "#7a7468", fontSize: 12.5, borderBottom: "1.5px solid #ddd6c7" },
+  logTime: { color: "#7a7468" },
+  logEmpty: { fontSize: 14, color: "#9a9484", padding: 8 },
+  footer: { fontSize: 12.5, color: "#9a9484", marginTop: 26, paddingTop: 16, borderTop: "1px solid #ddd6c7", lineHeight: 1.6 },
+};
+
+const styleEl = document.createElement("style");
+styleEl.textContent =
+  "@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');" +
+  ".pulse{animation:spin .9s linear infinite}" +
+  "@keyframes spin{to{transform:rotate(360deg)}}" +
+  "button:active{transform:translate(2px,2px)}" +
+  "@media(max-width:820px){.resp-grid{grid-template-columns:1fr !important}}";
+document.head.appendChild(styleEl);
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
